@@ -1,0 +1,20 @@
+#pragma once
+#include <torch/torch.h>
+#include <string>
+#include <vector>
+
+// Minimal placeholder dataset to keep training buildable without external deps.
+class LMDBDataset : public torch::data::Dataset<LMDBDataset> {
+public:
+    explicit LMDBDataset(const std::string& root);
+
+    torch::data::Example<> get(size_t index) override;
+    torch::optional<size_t> size() const override {
+        return total_samples_;
+    }
+
+private:
+    size_t total_samples_{0};
+    torch::Tensor dummy_x_;
+    torch::Tensor dummy_y_;
+};

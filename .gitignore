@@ -1,0 +1,127 @@
+### -------------------------
+### OS 공통
+### -------------------------
+# 임시/캐시
+*.tmp
+*.log
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+### -------------------------
+### Visual Studio
+### -------------------------
+# 빌드 산출물
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.sbr
+*.tlog
+*.lastbuildstate
+
+# VS 프로젝트 캐시
+.ipch/
+*.db
+*.opendb
+*.VC.db
+
+# 솔루션/프로젝트 자동 생성물
+*.VC.db*
+*.VC.opendb*
+
+# Debug/Release/Out/
+Debug/
+Release/
+x64/
+x86/
+ARM/
+ARM64/
+
+# VS 특유 폴더
+.vs/
+
+# CMake가 만든 VS 임시파일
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+### -------------------------
+### CMake
+### -------------------------
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+
+### -------------------------
+### Python 관련
+### -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 가상환경
+venv/
+env/
+.venv/
+
+# pip wheel/artifacts
+*.egg-info/
+dist/
+build/  # (주의: C++ build와 겹치므로 CMake build 폴더는 위에서 이미 제외됨)
+
+### -------------------------
+### LibTorch / 외부 라이브러리
+### -------------------------
+# LibTorch 바이너리(너무 크고 필요도 없음)
+extern/libtorch/
+
+### -------------------------
+### 데이터 파이프라인 (PGN, LMDB, 체크포인트)
+### -------------------------
+
+# LMDB 샤드
+data/lmdb/
+*.mdb
+*.dat
+*.lock
+
+# PGN 원본 (대용량)
+data/pgn_raw/
+*.pgn
+*.pgn.zst
+
+# 모델 체크포인트 (로컬만 저장)
+checkpoints/*.pt
+checkpoints/*.bin
+checkpoints/*.pth
+
+# 인덱싱/체크포인트 중간 파일
+*.index
+*.offset
+checkpoint.json
+meta.json
+
+### -------------------------
+### 로그/결과물
+### -------------------------
+logs/
+*.txt
+
+### -------------------------
+### 프로젝트 전용 임시산출물
+### -------------------------
+chess_uci.exe
+chess_train.exe
+*.exe
+*.dll
+*.out
