@@ -54,24 +54,31 @@ void Engine::SetPositionFromUCI(const std::string &cmd) {
 }
 
 std::string Engine::SearchBestMove(NNWrapper &nn, const std::string &goCmd) {
+  // go 명령에서 depth 파싱 (지금은 아직 사용 안 하지만, 나중 search.cpp 연동용)
   int depth = parseDepthFromGo(goCmd, 4);
   (void)depth;
 
+  // 1) 합법 수 생성
   std::vector<Move> moves;
   MoveGen::generate(b, moves);
 
   if (moves.empty())
     return "0000";
 
-  bool nnOk = nn.isReady();
+  // 2) NN 사용 가능한지 체크
+  bool useNN = nn.isReady();
   std::vector<float> policy;
 
-  if (nnOk) {
+  if (useNN) {
     policy = nn.Evaluate(b);
 
+    // 정책 벡터 크기 검증
     if (policy.size() != 4096) {
-      nnOk = false;
+      std::cerr << "[Engine] NN policy size invalid: " << policy.size()
+                << " (expected 4096)\n";
+      useNN = false;
     } else {
+      // 전부 0이면 NN 실패로 간주
       bool allZero = true;
       for (float v : policy) {
         if (v != 0.0f) {
@@ -79,18 +86,22 @@ std::string Engine::SearchBestMove(NNWrapper &nn, const std::string &goCmd) {
           break;
         }
       }
-      if (allZero)
-        nnOk = false;
+      if (allZero) {
+        std::cerr << "[Engine] NN policy all zero. Fallback to simple move\n";
+        useNN = false;
+      }
     }
   }
 
   Move best = moves.front();
 
-  if (nnOk) {
+  // 3) NN 정책을 사용해서 bestmove 선택
+  if (useNN) {
     float bestScore = -1e30f;
     bool found = false;
 
     for (const auto &m : moves) {
+      // from/to 범위 체크
       if (m.from < 0 || m.from >= 64 || m.to < 0 || m.to >= 64)
         continue;
 
@@ -106,11 +117,13 @@ std::string Engine::SearchBestMove(NNWrapper &nn, const std::string &goCmd) {
       }
     }
 
+    // NN 정책으로 선택된 수가 있으면 바로 반환
     if (found)
       return best.toUciString();
   }
 
-  // NN 실패 또는 비정상 출력 시: 첫 legal move로 폴백
+  // 4) NN이 비정상(ready 아님 / 출력 이상 / all zero)일 경우
+  //    → 일단 첫 legal move로 폴백
   return best.toUciString();
 }
 } // namespace chess

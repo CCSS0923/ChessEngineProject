@@ -2,19 +2,18 @@ import os
 import json
 import shutil
 import mmap
-from datetime import datetime
-from typing import Optional, Tuple, List
-
 import lmdb
 import msgpack
 import numpy as np
 import chess
 import chess.pgn
+from datetime import datetime
 from tqdm import tqdm
-
 from fen_to_tensor import board_to_tensor
 
-
+# ==========================
+# 경로 설정
+# ==========================
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(TOOLS_DIR, ".."))
 
@@ -24,16 +23,18 @@ OUT_ROOT = os.path.join(PROJECT_ROOT, "data", "lmdb", "standard_2025_01")
 CHECKPOINT_PATH = os.path.join(OUT_ROOT, "checkpoint.json")
 LOG_PATH = os.path.join(OUT_ROOT, "parse_pgn.log")
 
-SAMPLES_PER_SHARD = 1_000_000
+# ==========================
+# 설정 (실전용)
+# ==========================
+SAMPLES_PER_SHARD = 50_000_000        # 샤드당 최대 샘플 수 (5천만)
+MAP_SIZE = 64 * 1024 * 1024 * 1024    # LMDB map_size = 64GB
 COMMIT_INTERVAL = 10_000
-SHARDS_PER_RUN = 3
-SHARD_LIMIT = 64 * 1024 * 1024 * 1024
-
-TENSOR_SHAPE = [18, 8, 8]
-TENSOR_DTYPE = "uint8"
 MAX_GAME_RETRIES = 3
+SHARDS_PER_RUN = 3                    # 실행 1번당 최대 샤드 개수
 
-
+# ==========================
+# 로그
+# ==========================
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -45,7 +46,9 @@ def log(msg: str):
     except:
         pass
 
-
+# ==========================
+# Checkpoint
+# ==========================
 def load_checkpoint(total_games: int):
     if not os.path.exists(CHECKPOINT_PATH):
         return None
@@ -53,17 +56,16 @@ def load_checkpoint(total_games: int):
         with open(CHECKPOINT_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if data.get("total_games") != total_games:
-            log("[WARN] checkpoint total_games mismatch. ignore.")
+            log("[WARN] checkpoint mismatch → 무시")
             return None
-        last_game = data.get("last_game_index")
-        if isinstance(last_game, int) and 0 <= last_game < total_games:
-            return last_game
+        idx = data.get("last_game_index")
+        if isinstance(idx, int) and 0 <= idx < total_games:
+            return idx
     except Exception as e:
-        log(f"[WARN] load checkpoint failed: {e}")
+        log(f"[WARN] checkpoint load 실패: {e}")
     return None
 
-
-def save_checkpoint(last_game: int, total_games: int, global_index: int, shard_index: int):
+def save_checkpoint(last_game, total_games, global_index, shard_index):
     data = {
         "last_game_index": int(last_game),
         "total_games": int(total_games),
@@ -74,25 +76,33 @@ def save_checkpoint(last_game: int, total_games: int, global_index: int, shard_i
     try:
         with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        log(f"[CHECKPOINT] last_game={last_game}, total_samples={global_index}, shard_index={shard_index}")
+        log(f"[CHECKPOINT] last_game={last_game}, total_samples={global_index}, shard_index={shard_index:04d}")
     except Exception as e:
-        log(f"[WARN] save checkpoint failed: {e}")
+        log(f"[WARN] checkpoint 저장 실패: {e}")
 
-
-def result_to_base_value(r: str):
-    if r == "1-0": return 1.0
-    if r == "0-1": return -1.0
-    if r == "1/2-1/2": return 0.0
+# ==========================
+# 결과값 처리
+# ==========================
+def result_to_value(r: str):
+    if r == "1-0":
+        return 1.0
+    if r == "0-1":
+        return -1.0
+    if r == "1/2-1/2":
+        return 0.0
     return None
 
-
-def open_env(shard_index: int):
-    shard_name = f"shard_{shard_index:04d}"
-    shard_dir = os.path.join(OUT_ROOT, shard_name)
+# ==========================
+# Shard 관리
+# ==========================
+def open_shard(shard_index, map_size):
+    """map_size를 증가시키며 샤드를 열고 데이터 계속 추가"""
+    shard_dir = os.path.join(OUT_ROOT, f"shard_{shard_index:04d}")
     os.makedirs(shard_dir, exist_ok=True)
+
     env = lmdb.open(
         shard_dir,
-        map_size=1 << 40,
+        map_size=map_size,
         subdir=True,
         readonly=False,
         lock=True,
@@ -100,61 +110,55 @@ def open_env(shard_index: int):
         readahead=False,
         map_async=False,
     )
+    log(f"[SHARD] open shard_{shard_index:04d} with map_size={map_size}")
     return env, shard_dir
 
 
-def get_shard_size(shard_dir: str):
-    p = os.path.join(shard_dir, "data.mdb")
-    return os.path.getsize(p) if os.path.exists(p) else 0
-
-
-def write_meta(shard_dir, num_samples: int):
-    if num_samples <= 0:
-        return
+def write_meta(shard_dir, num_samples):
     meta = {
         "num_samples": int(num_samples),
-        "tensor_shape": TENSOR_SHAPE,
-        "tensor_dtype": TENSOR_DTYPE,
-        "label_type": "policy_value",
+        "tensor_shape": [18, 8, 8],
+        "tensor_dtype": "uint8",
+        "label_type": "policy_value"
     }
     with open(os.path.join(shard_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-
-def scan_and_clean_shards():
-    complete = []
+def scan_shards():
+    result = []
     if not os.path.exists(OUT_ROOT):
-        return complete
+        return result
     for d in os.listdir(OUT_ROOT):
-        if not (d.startswith("shard_") and len(d) == 10):
-            continue
-        shard_dir = os.path.join(OUT_ROOT, d)
-        meta_path = os.path.join(shard_dir, "meta.json")
-        if not os.path.exists(meta_path):
-            shutil.rmtree(shard_dir, ignore_errors=True)
-            continue
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            ns = int(meta.get("num_samples", 0))
-        except:
-            ns = 0
-        idx = int(d.split("_")[1])
-        complete.append((idx, shard_dir, ns))
-    complete.sort(key=lambda x: x[0])
-    return complete
+        if d.startswith("shard_") and len(d) == 10:
+            shard_path = os.path.join(OUT_ROOT, d)
+            meta_path = os.path.join(shard_path, "meta.json")
+            if not os.path.exists(meta_path):
+                # meta 없는 샤드는 불완전 → 삭제
+                shutil.rmtree(shard_path, ignore_errors=True)
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                num = int(meta.get("num_samples", 0))
+            except:
+                num = 0
+            idx = int(d.split("_")[1])
+            result.append((idx, shard_path, num))
+    result.sort(key=lambda x: x[0])
+    return result
 
-
-def index_pgn(path: str):
+# ==========================
+# 인덱싱 (캐시 없이 항상 새로)
+# ==========================
+def index_pgn_file():
     log("[INFO] fast indexing (Event offsets)...")
     offsets = []
     pattern = b"[Event "
+    size = os.path.getsize(PGN_PATH)
 
-    file_size = os.path.getsize(path)
-    with open(path, "rb") as f:
+    with open(PGN_PATH, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Indexing")
-
+        pbar = tqdm(total=size, unit="B", unit_scale=True, desc="Indexing")
         last = 0
         pos = mm.find(pattern)
         while pos != -1:
@@ -162,167 +166,167 @@ def index_pgn(path: str):
             pbar.update(pos - last)
             last = pos
             pos = mm.find(pattern, pos + 1)
-
-        pbar.update(file_size - last)
+        pbar.update(size - last)
         pbar.close()
         mm.close()
 
     log(f"[INFO] indexing complete: {len(offsets)} games")
     return offsets
 
-
+# ==========================
+# 메인 실행
+# ==========================
 def main():
-    try:
-        os.makedirs(OUT_ROOT, exist_ok=True)
-        log("===== NEW RUN STARTED =====")
+    os.makedirs(OUT_ROOT, exist_ok=True)
+    log("===== NEW RUN STARTED =====")
 
-        if not os.path.exists(PGN_PATH):
-            log(f"[ERROR] PGN not found: {PGN_PATH}")
-            return
+    # 기존 샤드 스캔
+    existing = scan_shards()
+    total_existing = sum(x[2] for x in existing)
+    next_shard = max([x[0] for x in existing], default=-1) + 1
 
-        existing = scan_and_clean_shards()
-        total_existing_samples = sum(x[2] for x in existing)
-        next_shard_index = max([x[0] for x in existing], default=-1) + 1
+    log(f"[INFO] existing shards={len(existing)}, total_samples={total_existing}")
+    log(f"[INFO] next shard index = {next_shard:04d}")
 
-        log(f"[INFO] existing shards={len(existing)}, total_samples={total_existing_samples}")
-        log(f"[INFO] next shard index = {next_shard_index:04d}")
+    # 인덱싱
+    offsets = index_pgn_file()
+    total_games = len(offsets)
 
-        offsets = index_pgn(PGN_PATH)
-        total_games = len(offsets)
-        if total_games == 0:
-            log("[ERROR] No games found.")
-            return
+    # 체크포인트
+    start_idx = load_checkpoint(total_games)
+    start_idx = 0 if start_idx is None else start_idx + 1
+    log(f"[INFO] start from game {start_idx}/{total_games}")
 
-        last_game = load_checkpoint(total_games)
-        start_idx = (last_game + 1) if last_game is not None else 0
-        if start_idx >= total_games:
-            log("[INFO] all games processed.")
-            return
+    shard_index = next_shard
+    map_size = MAP_SIZE  # 초기 map_size 설정
+    env, shard_dir = open_shard(shard_index, map_size)  # 첫 샤드 열기
+    txn = env.begin(write=True)
+    samples_in_shard = 0
+    global_index = total_existing
+    shards_created = 0
 
-        log(f"[INFO] start from game {start_idx}/{total_games}")
+    pbar = tqdm(total=total_games, initial=start_idx, desc="Writing LMDB", unit="game")
 
-        env, shard_dir = open_env(next_shard_index)
-        txn = env.begin(write=True)
+    game_idx = start_idx
+    while game_idx < total_games:
+        pbar.update(1)
 
-        shard_index = next_shard_index
-        samples_in_shard = 0
-        global_index = total_existing_samples
-        shards_created = 0
-        stop_run = False
+        pos = offsets[game_idx]
+        retries = 0
+        success = False
 
-        def finalize_shard():
-            nonlocal env, txn, shard_dir, samples_in_shard, total_existing_samples
-            txn.commit()
-            env.sync()
-            env.close()
-            write_meta(shard_dir, samples_in_shard)
-            total_existing_samples += samples_in_shard
-            log(f"[SHARD] finalized shard_{shard_index:04d} samples={samples_in_shard}")
-            samples_in_shard = 0
-
-        with open(PGN_PATH, "r", encoding="utf-8", errors="replace") as f:
-            pbar = tqdm(total=total_games, initial=start_idx, desc="Writing LMDB", unit="game")
-
-            for game_idx in range(start_idx, total_games):
-                if stop_run:
+        while retries < MAX_GAME_RETRIES and not success:
+            try:
+                f.seek(pos)  # 이 부분에서 'f'를 파일 핸들러로 제대로 정의
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    success = True
                     break
 
-                pbar.update(1)
-                pos = offsets[game_idx]
+                base_value = result_to_value(game.headers.get("Result", ""))
+                if base_value is None:
+                    success = True
+                    break
 
-                retries = 0
-                success = False
+                moves = list(game.mainline_moves())
+                move_count = len(moves)
 
-                while retries < MAX_GAME_RETRIES and not success:
-                    try:
-                        f.seek(pos)
-                        game = chess.pgn.read_game(f)
-                        if game is None:
-                            log(f"[WARN] game {game_idx} read None → skip")
-                            success = True
+                # 샤드 용량 초과 시, 현재 샤드에서 map_size 증가 후 계속 처리
+                projected = samples_in_shard + move_count
+                while projected > SAMPLES_PER_SHARD:
+                    # 현재 샤드에서 map_size 확장
+                    map_size += (64 * 1024 * 1024 * 1024)  # 64GB씩 증가
+                    finalize_current_shard()  # 현재 샤드 저장
+                    open_new_shard(shard_index, map_size)  # 증가된 map_size로 새 샤드 열기
+                    projected -= SAMPLES_PER_SHARD  # 넘친 만큼 계속 처리
+                    samples_in_shard = 0  # 샤드 리셋
+
+                board = game.board()
+
+                for mv in moves:
+                    arr = board_to_tensor(board)
+                    arr = np.asarray(arr, dtype=np.uint8)
+                    tensor_bytes = arr.tobytes()
+
+                    policy = mv.from_square * 64 + mv.to_square
+                    value = base_value if board.turn == chess.WHITE else -base_value
+
+                    obj = {
+                        "tensor": tensor_bytes,
+                        "shape": list(arr.shape),
+                        "dtype": "uint8",
+                        "label": {
+                            "policy": int(policy),
+                            "value": float(value)
+                        },
+                    }
+
+                    key = f"{global_index:012d}".encode()
+                    data = msgpack.packb(obj, use_bin_type=True)
+
+                    # MapFull 방어: map_size 초과 시 자동 샤드 롤오버
+                    while True:
+                        try:
+                            txn.put(key, data)
                             break
-
-                        base_value = result_to_base_value(game.headers.get("Result", ""))
-                        if base_value is None:
-                            success = True
-                            break
-
-                        board = game.board()
-                        moves = list(game.mainline_moves())
-
-                        projected_samples = samples_in_shard + len(moves)
-                        projected_size = get_shard_size(shard_dir)
-
-                        if projected_samples >= SAMPLES_PER_SHARD or projected_size >= SHARD_LIMIT:
-                            finalize_shard()
+                        except lmdb.MapFullError as e:
+                            log(f"[WARN] MapFullError at global_index={global_index}, shard={shard_index:04d}: {e}")
+                            finalize_current_shard()
                             shards_created += 1
                             if shards_created >= SHARDS_PER_RUN:
-                                stop_run = True
-                                success = True
-                                break
+                                pbar.close()
+                                save_checkpoint(
+                                    last_game=game_idx,
+                                    total_games=total_games,
+                                    global_index=global_index,
+                                    shard_index=shard_index
+                                )
+                                log(f"[DONE] total samples={global_index}")
+                                log("===== RUN FINISHED =====")
+                                return
                             shard_index += 1
-                            env, shard_dir = open_env(shard_index)
-                            txn = env.begin(write=True)
-                            log(f"[SHARD] open new shard_{shard_index:04d}")
+                            map_size = map_size + (64 * 1024 * 1024 * 1024)  # 64GB씩 증가
+                            open_new_shard(shard_index, map_size)
 
-                        for mv in moves:
-                            arr = board_to_tensor(board)
-                            arr_u8 = np.asarray(arr, dtype=np.uint8)
-                            tensor_bytes = arr_u8.tobytes()
+                    samples_in_shard += 1
+                    global_index += 1
 
-                            move_idx = mv.from_square * 64 + mv.to_square
-                            value = base_value if board.turn == chess.WHITE else -base_value
+                    if (global_index % COMMIT_INTERVAL) == 0:
+                        try:
+                            txn.commit()
+                            env.sync()
+                        except lmdb.Error as e:
+                            log(f"[WARN] periodic commit 실패(무시): {e}")
+                        txn = env.begin(write=True)
 
-                            obj = {
-                                "tensor": tensor_bytes,
-                                "shape": list(arr_u8.shape),
-                                "dtype": "uint8",
-                                "label": {"policy": int(move_idx), "value": float(value)},
-                            }
+                    board.push(mv)
 
-                            key = f"{global_index:012d}".encode()
-                            txn.put(key, msgpack.packb(obj, use_bin_type=True))
+                success = True
 
-                            samples_in_shard += 1
-                            global_index += 1
+            except Exception as e:
+                retries += 1
+                log(f"[ERROR] game_idx={game_idx}, retry={retries}, err={e}")
 
-                            if global_index % COMMIT_INTERVAL == 0:
-                                txn.commit()
-                                env.sync()
-                                txn = env.begin(write=True)
+        if not success:
+            log(f"[WARN] skip game_idx={game_idx} (after {MAX_GAME_RETRIES} retries)")
 
-                            board.push(mv)
+        game_idx += 1
 
-                        success = True
+    pbar.close()
 
-                    except Exception as e:
-                        retries += 1
-                        log(f"[ERROR] game_idx={game_idx}, retry={retries}, err={e}")
+    # 전체 PGN 끝까지 처리한 경우
+    if samples_in_shard > 0 and env is not None and txn is not None:
+        finalize_current_shard()
 
-                if not success:
-                    log(f"[WARN] skip game_idx={game_idx}")
+    save_checkpoint(
+        last_game=total_games - 1,
+        total_games=total_games,
+        global_index=global_index,
+        shard_index=shard_index
+    )
 
-            pbar.close()
-
-        finalize_shard()
-        after = scan_and_clean_shards()
-        total_after = sum(x[2] for x in after)
-
-        save_checkpoint(
-            last_game=game_idx if start_idx < total_games else total_games - 1,
-            total_games=total_games,
-            global_index=total_after,
-            shard_index=after[-1][0] if after else shard_index,
-        )
-
-        log(f"[DONE] total samples={total_after}")
-        log("===== RUN FINISHED =====")
-
-    except Exception as e:
-        log(f"[FATAL] 예외 발생: {e}")
-        from parse_pgn_envcheck import env_diagnose
-        env_diagnose(PGN_PATH, OUT_ROOT, TOOLS_DIR, PROJECT_ROOT, LOG_PATH)
-        raise
+    log(f"[DONE] total samples={global_index}")
+    log("===== RUN FINISHED =====")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+DATA_PATH = "D:/data/lmdb/shard_0000"
+BATCH_SIZE = 256
+LR = 1e-3
+EPOCHS = 1
+NUM_WORKERS = 8
