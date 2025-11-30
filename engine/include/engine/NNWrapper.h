@@ -24,10 +24,16 @@ public:
   void init(const std::string &modelPath, int deviceIndex = -1);
   bool isReady() const;
 
+  // 치명적인 오류 이후 NN 사용 비활성화
+  void disable();
+
+  // 마지막 오류 메시지 조회
+  const std::string &lastError() const;
+
   // 기존: tensor 입력 버전
   NNResult evaluate(const uint8_t *inputCHW);
 
-  // 새로 추가: Board → policy vector
+  // Board → policy vector
   std::vector<float> Evaluate(const Board &board);
 
 private:
@@ -41,6 +47,7 @@ private:
   torch::jit::script::Module m_module;
   torch::Device m_device;
   bool m_ready = false;
+  std::string m_lastError;
 };
 
 } // namespace chess

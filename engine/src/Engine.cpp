@@ -63,24 +63,54 @@ std::string Engine::SearchBestMove(NNWrapper &nn, const std::string &goCmd) {
   if (moves.empty())
     return "0000";
 
-  // ★★★ 수정 후 정상 작동: Board → NNWrapper.Evaluate(Board)
-  std::vector<float> policy = nn.Evaluate(b);
+  bool nnOk = nn.isReady();
+  std::vector<float> policy;
 
-  float bestScore = -1e30f;
-  Move best = moves.front();
+  if (nnOk) {
+    policy = nn.Evaluate(b);
 
-  for (const auto &m : moves) {
-    if (m.from < 0 || m.from >= 64 || m.to < 0 || m.to >= 64)
-      continue;
-
-    float s = policy[m.from * 64 + m.to];
-    if (s > bestScore) {
-      bestScore = s;
-      best = m;
+    if (policy.size() != 4096) {
+      nnOk = false;
+    } else {
+      bool allZero = true;
+      for (float v : policy) {
+        if (v != 0.0f) {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero)
+        nnOk = false;
     }
   }
 
+  Move best = moves.front();
+
+  if (nnOk) {
+    float bestScore = -1e30f;
+    bool found = false;
+
+    for (const auto &m : moves) {
+      if (m.from < 0 || m.from >= 64 || m.to < 0 || m.to >= 64)
+        continue;
+
+      int idx = m.from * 64 + m.to;
+      if (idx < 0 || idx >= static_cast<int>(policy.size()))
+        continue;
+
+      float s = policy[static_cast<std::size_t>(idx)];
+      if (!found || s > bestScore) {
+        bestScore = s;
+        best = m;
+        found = true;
+      }
+    }
+
+    if (found)
+      return best.toUciString();
+  }
+
+  // NN 실패 또는 비정상 출력 시: 첫 legal move로 폴백
   return best.toUciString();
 }
-
 } // namespace chess

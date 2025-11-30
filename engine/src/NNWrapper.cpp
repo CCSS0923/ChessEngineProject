@@ -20,19 +20,27 @@ NNWrapper::NNWrapper() : m_device(torch::kCPU), m_ready(false) {}
 
 bool NNWrapper::isReady() const { return m_ready; }
 
+void NNWrapper::disable() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_ready = false;
+}
+
+const std::string &NNWrapper::lastError() const { return m_lastError; }
+
 void NNWrapper::init(const std::string &modelPath, int deviceIndex) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_ready = false;
+  m_lastError.clear();
 
-  // 1) 먼저 파일 존재 / 열기 확인
   std::ifstream ifs(modelPath, std::ios::binary);
   if (!ifs) {
-    std::cerr << "[NNWrapper] model not found: " << modelPath << std::endl;
+    m_lastError = "model not found: " + modelPath;
+    std::cerr << "[NNWrapper] " << m_lastError << std::endl;
     return;
   }
 
   try {
-    // 2) 디바이스 결정
+    // 1) 디바이스 결정
     if (deviceIndex >= 0 && torch::cuda::is_available()) {
       m_device = torch::Device(torch::kCUDA, deviceIndex);
       std::cout << "[NNWrapper] Using CUDA:" << deviceIndex << "\n";
@@ -41,16 +49,61 @@ void NNWrapper::init(const std::string &modelPath, int deviceIndex) {
       std::cout << "[NNWrapper] Using CPU\n";
     }
 
-    // 3) 경로 기반 오버로드 대신, 스트림 기반 오버로드 사용
+    // 2) 모델 로드
     m_module = torch::jit::load(ifs, m_device);
     m_module.eval();
-    m_ready = true;
-
-    std::cout << "[NNWrapper] Model loaded OK\n";
   } catch (const c10::Error &e) {
-    std::cerr << "[NNWrapper] load error: " << e.what() << std::endl;
-    m_ready = false;
+    m_lastError = e.what_without_backtrace();
+    std::cerr << "[NNWrapper] load error(c10): " << m_lastError << std::endl;
+    return;
+  } catch (const std::exception &e) {
+    m_lastError = e.what();
+    std::cerr << "[NNWrapper] load error(std): " << m_lastError << std::endl;
+    return;
+  } catch (...) {
+    m_lastError = "unknown exception in init()";
+    std::cerr << "[NNWrapper] load error: " << m_lastError << std::endl;
+    return;
   }
+
+  // 3) forward 검증
+  try {
+    torch::Tensor dummy = torch::zeros(
+        {1, 18, 8, 8},
+        torch::TensorOptions().dtype(torch::kFloat32).device(m_device));
+
+    std::vector<torch::jit::IValue> inp;
+    inp.emplace_back(dummy);
+
+    auto out = m_module.forward(inp);
+    auto tup = out.toTuple();
+
+    if (!tup || tup->elements().size() < 2 || !tup->elements()[0].isTensor() ||
+        !tup->elements()[1].isTensor()) {
+      m_lastError = "model forward validation failed";
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      return;
+    }
+
+  } catch (const c10::Error &e) {
+    m_lastError =
+        std::string("forward validation c10: ") + e.what_without_backtrace();
+    std::cerr << "[NNWrapper] " << m_lastError << "\n";
+    return;
+  } catch (const std::exception &e) {
+    m_lastError = std::string("forward validation std: ") + e.what();
+    std::cerr << "[NNWrapper] " << m_lastError << "\n";
+    return;
+  } catch (...) {
+    m_lastError = "model forward validation threw unknown exception";
+    std::cerr << "[NNWrapper] " << m_lastError << "\n";
+    return;
+  }
+
+  // 4) 여기까지 왔으면 진짜로 ready
+  m_ready = true;
+  m_lastError.clear();
+  std::cout << "[NNWrapper] Model loaded OK\n";
 }
 
 NNResult NNWrapper::evaluate(const uint8_t *inputCHW) {
@@ -72,24 +125,77 @@ NNResult NNWrapper::evaluate(const uint8_t *inputCHW) {
     inputs.emplace_back(input);
 
     torch::jit::IValue out = m_module.forward(inputs);
-    auto tup = out.toTuple();
 
-    auto policy = tup->elements()[0].toTensor().to(torch::kCPU).view({4096});
-    auto value = tup->elements()[1].toTensor().to(torch::kCPU).view({1});
+    if (!out.isTuple()) {
+      m_lastError = "model output is not tuple";
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      m_ready = false;
+      return result;
+    }
+
+    auto tup = out.toTuple();
+    if (!tup || tup->elements().size() < 2) {
+      m_lastError = "model output tuple size < 2";
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      m_ready = false;
+      return result;
+    }
+
+    auto policyI = tup->elements()[0];
+    auto valueI = tup->elements()[1];
+
+    if (!policyI.isTensor() || !valueI.isTensor()) {
+      m_lastError = "model output elements are not tensors";
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      m_ready = false;
+      return result;
+    }
+
+    auto policyT = policyI.toTensor().to(torch::kCPU);
+    auto valueT = valueI.toTensor().to(torch::kCPU);
+
+    if (!policyT.defined() || policyT.numel() != 4096) {
+      m_lastError = "policy tensor has invalid shape, numel=" +
+                    std::to_string(policyT.numel());
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      m_ready = false;
+      return result;
+    }
+
+    policyT = policyT.view({4096});
+    valueT = valueT.view(-1);
+
+    if (!valueT.defined() || valueT.numel() < 1) {
+      m_lastError = "value tensor has invalid shape";
+      std::cerr << "[NNWrapper] " << m_lastError << "\n";
+      m_ready = false;
+      return result;
+    }
 
     for (int i = 0; i < 4096; ++i)
-      result.policy[i] = policy[i].item<float>();
+      result.policy[i] = policyT[i].item<float>();
 
-    result.value = value[0].item<float>();
+    result.value = valueT[0].item<float>();
     result.ok = true;
+    m_lastError.clear();
+  } catch (const c10::Error &e) {
+    m_lastError = e.what_without_backtrace();
+    std::cerr << "[NNWrapper] evaluate failed(c10): " << m_lastError << "\n";
+    m_ready = false;
+  } catch (const std::exception &e) {
+    m_lastError = e.what();
+    std::cerr << "[NNWrapper] evaluate failed(std): " << m_lastError << "\n";
+    m_ready = false;
   } catch (...) {
-    std::cerr << "[NNWrapper] evaluate failed\n";
+    m_lastError = "unknown exception in evaluate()";
+    std::cerr << "[NNWrapper] evaluate failed(unknown)\n";
+    m_ready = false;
   }
 
   return result;
 }
 
-// ★★★★★ 핵심: Board → policy vector 버전
+// Board → policy vector 버전
 std::vector<float> NNWrapper::Evaluate(const Board &board) {
   std::vector<float> out(4096, 0.0f);
 
